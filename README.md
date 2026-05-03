@@ -281,11 +281,15 @@ DELETE /api/accessories/<id>           - Delete accessory (protected)
 curl -X POST http://localhost:5000/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{
-    "first_name": "John",
-    "last_name": "Doe",
-    "email": "john@example.com",
-    "password": "secure123",
-    "phone": "+1234567890"
+    "address": "2/96,Pillayar kovil street,Sengottai",
+        "email": "munees@gmail.com",
+        "first_name": "Muneeswaran",
+        "id_number": "123456789012",
+        "id_type": "Aadhar",
+        "password": "1234",
+        "last_name": "D",
+        "nationality": "Indian",
+        "phone": "+918754198220"
   }'
 ```
 

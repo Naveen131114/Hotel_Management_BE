@@ -27,6 +27,8 @@ def register():
             last_name=data['last_name'],
             email=data['email'],
             phone=data.get('phone'),
+            id_number=data.get('id_number'),
+            id_type=data.get('id_type'),
             nationality=data.get('nationality'),
             address=data.get('address')
         )
