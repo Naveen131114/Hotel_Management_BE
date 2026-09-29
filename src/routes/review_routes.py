@@ -1,38 +1,50 @@
 from flask import Blueprint, request
-from sqlalchemy import func
+
 from src import db
 from src.models.reviews import Review
-from src.utils import success_response, error_response, token_required
+from src.models.rooms import Room
+from src.models.room_records import RoomRecord
+from src.utils import (
+    success_response, error_response, auth_required, require_permission, tenant_scope,
+    log_activity, get_current_user,
+)
+from src.utils.constants import ACTIVITY_CREATE, ACTIVITY_DELETE, ACTIVITY_UPDATE
 
 bp = Blueprint('reviews', __name__, url_prefix='/api/reviews')
 
 
+def _scoped(query):
+    """Reviews inherit the tenant scope through their room"""
+    return query.filter(Review.room_id.in_(
+        tenant_scope(Room, Room.query).with_entities(Room.id)
+    ))
+
+
 @bp.route('', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_all_reviews():
-    """Get all reviews with optional filters"""
+    """Get all reviews of the current hotel"""
     try:
-        query = Review.query
-        
+        query = _scoped(Review.query)
         if request.args.get('room_id'):
             query = query.filter_by(room_id=request.args.get('room_id'))
-        if request.args.get('user_id'):
-            query = query.filter_by(user_id=request.args.get('user_id'))
-        if request.args.get('is_published'):
-            is_published = request.args.get('is_published').lower() == 'true'
-            query = query.filter_by(is_published=is_published)
-        
-        reviews = query.all()
-        data = [review.to_dict() for review in reviews]
-        return success_response('Reviews fetched successfully', data, status_code=200)
+        if request.args.get('is_published') in ('1', 'true'):
+            query = query.filter(Review.is_published.is_(True))
+        reviews = query.order_by(Review.created_at.desc()).all()
+        return success_response('Reviews fetched successfully',
+                                [review.to_dict() for review in reviews], status_code=200)
     except Exception as e:
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_review(id):
-    """Get review by ID"""
+    """Get a review by ID (tenant scoped)"""
     try:
-        review = Review.query.get(id)
+        review = _scoped(Review.query).filter(Review.id == id).first()
         if not review:
             return error_response('Review not found', 404)
         return success_response('Review fetched successfully', review.to_dict(), status_code=200)
@@ -40,67 +52,39 @@ def get_review(id):
         return error_response(f'Error: {str(e)}', 500)
 
 
-@bp.route('/room/<int:room_id>/average-rating', methods=['GET'])
-def get_average_rating(room_id):
-    """Get average ratings for a room"""
-    try:
-        reviews = Review.query.filter_by(room_id=room_id, is_published=True).all()
-        
-        if not reviews:
-            return success_response('No reviews found', {
-                'room_id': room_id,
-                'average_rating': 0,
-                'cleanliness_rating': 0,
-                'staff_rating': 0,
-                'value_rating': 0,
-                'total_reviews': 0
-            }, status_code=200)
-        
-        avg_rating = sum(r.rating for r in reviews) / len(reviews)
-        avg_cleanliness = sum(r.cleanliness_rating for r in reviews if r.cleanliness_rating) / len([r for r in reviews if r.cleanliness_rating]) if any(r.cleanliness_rating for r in reviews) else 0
-        avg_staff = sum(r.staff_rating for r in reviews if r.staff_rating) / len([r for r in reviews if r.staff_rating]) if any(r.staff_rating for r in reviews) else 0
-        avg_value = sum(r.value_rating for r in reviews if r.value_rating) / len([r for r in reviews if r.value_rating]) if any(r.value_rating for r in reviews) else 0
-        
-        data = {
-            'room_id': room_id,
-            'average_rating': round(avg_rating, 2),
-            'cleanliness_rating': round(avg_cleanliness, 2),
-            'staff_rating': round(avg_staff, 2),
-            'value_rating': round(avg_value, 2),
-            'total_reviews': len(reviews)
-        }
-        
-        return success_response('Average ratings fetched successfully', data, status_code=200)
-    except Exception as e:
-        return error_response(f'Error: {str(e)}', 500)
-
-
 @bp.route('', methods=['POST'])
-@token_required
+@auth_required()
+@require_permission('create')
 def create_review():
-    """Create a new review (protected)"""
+    """Create a review for a booking of the current hotel"""
     try:
         data = request.get_json()
-        
-        required_fields = ['room_record_id', 'user_id', 'room_id', 'rating']
-        if not all(field in data for field in required_fields):
-            return error_response('Missing required fields', 400)
-        
+        required = ['room_record_id', 'rating']
+        if not all(field in data for field in required):
+            return error_response('room_record_id and rating are required', 400)
+
+        booking = tenant_scope(RoomRecord, RoomRecord.query).filter(
+            RoomRecord.id == data['room_record_id']
+        ).first()
+        if not booking:
+            return error_response('Booking not found', 404)
+
         review = Review(
-            room_record_id=data['room_record_id'],
-            user_id=data['user_id'],
-            room_id=data['room_id'],
-            rating=data['rating'],
+            room_record_id=booking.id,
+            user_id=data.get('user_id') or booking.user_id,
+            room_id=booking.room_id,
+            rating=int(data['rating']),
             cleanliness_rating=data.get('cleanliness_rating'),
             staff_rating=data.get('staff_rating'),
             value_rating=data.get('value_rating'),
             comment=data.get('comment'),
             is_published=data.get('is_published', True)
         )
-        
         db.session.add(review)
         db.session.commit()
-        
+
+        log_activity(ACTIVITY_CREATE, 'reviews', review.id, booking.booking_number,
+                     f"Added review for booking {booking.booking_number}", branch_id=booking.branch_id)
         return success_response('Review created successfully', review.to_dict(), status_code=201)
     except Exception as e:
         db.session.rollback()
@@ -108,31 +92,23 @@ def create_review():
 
 
 @bp.route('/<int:id>', methods=['PUT'])
-@token_required
+@auth_required()
+@require_permission('edit')
 def update_review(id):
-    """Update review (protected)"""
+    """Update a review (moderation, publish/unpublish)"""
     try:
-        review = Review.query.get(id)
+        review = _scoped(Review.query).filter(Review.id == id).first()
         if not review:
             return error_response('Review not found', 404)
-        
+
         data = request.get_json()
-        
-        if 'rating' in data:
-            review.rating = data['rating']
-        if 'cleanliness_rating' in data:
-            review.cleanliness_rating = data['cleanliness_rating']
-        if 'staff_rating' in data:
-            review.staff_rating = data['staff_rating']
-        if 'value_rating' in data:
-            review.value_rating = data['value_rating']
-        if 'comment' in data:
-            review.comment = data['comment']
-        if 'is_published' in data:
-            review.is_published = data['is_published']
-        
+        for field in ('rating', 'cleanliness_rating', 'staff_rating', 'value_rating',
+                      'comment', 'is_published'):
+            if field in data:
+                setattr(review, field, data[field])
         db.session.commit()
-        
+
+        log_activity(ACTIVITY_UPDATE, 'reviews', review.id, None, f"Updated review #{review.id}")
         return success_response('Review updated successfully', review.to_dict(), status_code=200)
     except Exception as e:
         db.session.rollback()
@@ -140,17 +116,19 @@ def update_review(id):
 
 
 @bp.route('/<int:id>', methods=['DELETE'])
-@token_required
+@auth_required()
+@require_permission('delete')
 def delete_review(id):
-    """Delete review (protected)"""
+    """Delete a review"""
     try:
-        review = Review.query.get(id)
+        review = _scoped(Review.query).filter(Review.id == id).first()
         if not review:
             return error_response('Review not found', 404)
-        
+
         db.session.delete(review)
         db.session.commit()
-        
+
+        log_activity(ACTIVITY_DELETE, 'reviews', id, None, f"Deleted review #{id}")
         return success_response('Review deleted successfully', status_code=200)
     except Exception as e:
         db.session.rollback()

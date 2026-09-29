@@ -1,113 +1,136 @@
 from flask import Blueprint, request
+
 from src import db
 from src.models.room_accessories import RoomAccessory
-from src.utils import success_response, error_response, token_required
+from src.models.rooms import Room
+from src.models.accessories import Accessory
+from src.utils import (
+    success_response, error_response, auth_required, require_permission, tenant_scope,
+    log_activity, get_current_user,
+)
+from src.utils.constants import ACTIVITY_CREATE, ACTIVITY_DELETE, ACTIVITY_UPDATE
 
 bp = Blueprint('room_accessories', __name__, url_prefix='/api/room-accessories')
 
 
+def _scoped(query):
+    """Room-accessory records inherit the tenant scope through their room"""
+    return query.filter(RoomAccessory.room_id.in_(
+        tenant_scope(Room, Room.query).with_entities(Room.id)
+    ))
+
+
 @bp.route('', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_all_room_accessories():
-    """Get all room accessories with optional filters"""
+    """Get accessories assigned to rooms of the current hotel"""
     try:
-        query = RoomAccessory.query
-        
+        query = _scoped(RoomAccessory.query)
         if request.args.get('room_id'):
             query = query.filter_by(room_id=request.args.get('room_id'))
-        if request.args.get('condition'):
-            query = query.filter_by(condition=request.args.get('condition'))
-        
-        room_accessories = query.all()
-        data = [ra.to_dict() for ra in room_accessories]
-        return success_response('Room accessories fetched successfully', data, status_code=200)
+        items = query.all()
+        return success_response('Room accessories fetched successfully',
+                                [item.to_dict() for item in items], status_code=200)
     except Exception as e:
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_room_accessory(id):
-    """Get room accessory by ID"""
+    """Get a room-accessory record by ID (tenant scoped)"""
     try:
-        room_accessory = RoomAccessory.query.get(id)
-        if not room_accessory:
+        item = _scoped(RoomAccessory.query).filter(RoomAccessory.id == id).first()
+        if not item:
             return error_response('Room accessory not found', 404)
-        return success_response('Room accessory fetched successfully', room_accessory.to_dict(), status_code=200)
+        return success_response('Room accessory fetched successfully', item.to_dict(), status_code=200)
     except Exception as e:
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('', methods=['POST'])
-@token_required
+@auth_required()
+@require_permission('create')
 def create_room_accessory():
-    """Create a new room accessory (protected)"""
+    """Assign an accessory to a room (room and accessory must belong to the hotel)"""
     try:
         data = request.get_json()
-        
-        required_fields = ['room_id', 'accessory_id']
-        if not all(field in data for field in required_fields):
-            return error_response('Missing required fields', 400)
-        
-        # Check if already exists
-        existing = RoomAccessory.query.filter_by(
-            room_id=data['room_id'],
-            accessory_id=data['accessory_id']
-        ).first()
-        
+        if not data.get('room_id') or not data.get('accessory_id'):
+            return error_response('room_id and accessory_id are required', 400)
+
+        room = tenant_scope(Room, Room.query).filter(Room.id == data['room_id']).first()
+        if not room:
+            return error_response('Room not found', 404)
+
+        accessory = Accessory.query.filter_by(id=data['accessory_id'], business_id=room.business_id).first()
+        if accessory is None:
+            return error_response('Accessory not found for this hotel', 404)
+
+        existing = RoomAccessory.query.filter_by(room_id=room.id, accessory_id=accessory.id).first()
         if existing:
-            return error_response('Room accessory already exists', 400)
-        
-        room_accessory = RoomAccessory(
-            room_id=data['room_id'],
-            accessory_id=data['accessory_id'],
+            existing.quantity = data.get('quantity', existing.quantity)
+            existing.condition = data.get('condition', existing.condition)
+            db.session.commit()
+            return success_response('Room accessory updated successfully', existing.to_dict(), status_code=200)
+
+        item = RoomAccessory(
+            room_id=room.id,
+            accessory_id=accessory.id,
             quantity=data.get('quantity', 1),
             condition=data.get('condition', 'good')
         )
-        
-        db.session.add(room_accessory)
+        db.session.add(item)
         db.session.commit()
-        
-        return success_response('Room accessory created successfully', room_accessory.to_dict(), status_code=201)
+
+        log_activity(ACTIVITY_CREATE, 'room_accessories', item.id, room.room_number,
+                     f"Assigned accessory {accessory.name} to room {room.room_number}",
+                     branch_id=room.branch_id)
+        return success_response('Room accessory created successfully', item.to_dict(), status_code=201)
     except Exception as e:
         db.session.rollback()
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['PUT'])
-@token_required
+@auth_required()
+@require_permission('edit')
 def update_room_accessory(id):
-    """Update room accessory (protected)"""
+    """Update a room-accessory record"""
     try:
-        room_accessory = RoomAccessory.query.get(id)
-        if not room_accessory:
+        item = _scoped(RoomAccessory.query).filter(RoomAccessory.id == id).first()
+        if not item:
             return error_response('Room accessory not found', 404)
-        
+
         data = request.get_json()
-        
-        if 'quantity' in data:
-            room_accessory.quantity = data['quantity']
-        if 'condition' in data:
-            room_accessory.condition = data['condition']
-        
+        for field in ('quantity', 'condition'):
+            if field in data:
+                setattr(item, field, data[field])
         db.session.commit()
-        
-        return success_response('Room accessory updated successfully', room_accessory.to_dict(), status_code=200)
+
+        log_activity(ACTIVITY_UPDATE, 'room_accessories', item.id, None,
+                     f"Updated room accessory #{item.id}", branch_id=item.room.branch_id if item.room else None)
+        return success_response('Room accessory updated successfully', item.to_dict(), status_code=200)
     except Exception as e:
         db.session.rollback()
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['DELETE'])
-@token_required
+@auth_required()
+@require_permission('delete')
 def delete_room_accessory(id):
-    """Delete room accessory (protected)"""
+    """Remove an accessory from a room"""
     try:
-        room_accessory = RoomAccessory.query.get(id)
-        if not room_accessory:
+        item = _scoped(RoomAccessory.query).filter(RoomAccessory.id == id).first()
+        if not item:
             return error_response('Room accessory not found', 404)
-        
-        db.session.delete(room_accessory)
+
+        db.session.delete(item)
         db.session.commit()
-        
+
+        log_activity(ACTIVITY_DELETE, 'room_accessories', id, None, f"Removed room accessory #{id}")
         return success_response('Room accessory deleted successfully', status_code=200)
     except Exception as e:
         db.session.rollback()

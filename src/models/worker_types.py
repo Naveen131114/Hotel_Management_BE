@@ -7,9 +7,12 @@ class WorkerType(db.Model):
     __tablename__ = 'worker_types'
     
     id = db.Column(db.Integer, primary_key=True)
+    business_id = db.Column(db.Integer, db.ForeignKey('businesses.id'), index=True)
     title = db.Column(db.String(100), nullable=False)  # receptionist, housekeeping, manager
     description = db.Column(db.Text)
     base_salary = db.Column(db.Numeric(10, 2))
+    created_by = db.Column(db.Integer)
+    updated_by = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -18,6 +21,7 @@ class WorkerType(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'business_id': self.business_id,
             'title': self.title,
             'description': self.description,
             'base_salary': float(self.base_salary) if self.base_salary else 0,

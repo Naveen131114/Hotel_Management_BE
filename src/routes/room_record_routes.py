@@ -1,17 +1,31 @@
+"""Legacy booking endpoints (/api/room-records) kept for backward compatibility.
+
+POST now delegates to `booking_service`, so bookings created here are validated
+against the same availability rules as every other channel.
+New integrations should use `/api/bookings`.
+"""
 from flask import Blueprint, request
+
 from src import db
 from src.models.room_records import RoomRecord
-from src.utils import success_response, error_response, token_required
+from src.services import booking_service
+from src.utils import (
+    success_response, error_response, auth_required, require_permission, tenant_scope,
+    log_activity, get_current_user, current_business_id, current_branch_id,
+)
+from src.utils.constants import ACTIVITY_CREATE, ACTIVITY_DELETE, ACTIVITY_UPDATE, MODULE_BOOKINGS
 
 bp = Blueprint('room_records', __name__, url_prefix='/api/room-records')
 
 
 @bp.route('', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_all_room_records():
-    """Get all room records with optional filters"""
+    """Get all room records of the current hotel/branch with optional filters"""
     try:
-        query = RoomRecord.query
-        
+        query = tenant_scope(RoomRecord, RoomRecord.query.filter(RoomRecord.is_deleted.is_(False)))
+
         if request.args.get('room_id'):
             query = query.filter_by(room_id=request.args.get('room_id'))
         if request.args.get('user_id'):
@@ -20,110 +34,103 @@ def get_all_room_records():
             query = query.filter_by(booking_status=request.args.get('booking_status'))
         if request.args.get('payment_status'):
             query = query.filter_by(payment_status=request.args.get('payment_status'))
-        
-        room_records = query.all()
-        data = [rr.to_dict() for rr in room_records]
-        return success_response('Room records fetched successfully', data, status_code=200)
+
+        room_records = query.order_by(RoomRecord.check_in_date.desc()).all()
+        return success_response('Room records fetched successfully',
+                                [rr.to_dict() for rr in room_records], status_code=200)
     except Exception as e:
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['GET'])
+@auth_required()
+@require_permission('view')
 def get_room_record(id):
-    """Get room record by ID"""
+    """Get room record by ID (tenant scoped)"""
     try:
-        room_record = RoomRecord.query.get(id)
+        room_record = tenant_scope(RoomRecord, RoomRecord.query).filter(RoomRecord.id == id).first()
         if not room_record:
             return error_response('Room record not found', 404)
-        return success_response('Room record fetched successfully', room_record.to_dict(), status_code=200)
+        return success_response('Room record fetched successfully',
+                                room_record.to_dict(include_payments=True), status_code=200)
     except Exception as e:
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('', methods=['POST'])
-@token_required
+@auth_required()
+@require_permission('create')
 def create_room_record():
-    """Create a new room record (protected)"""
+    """Create a booking through the shared booking service (availability enforced)"""
     try:
-        data = request.get_json()
-        
-        required_fields = ['room_id', 'user_id', 'check_in_date', 'check_out_date', 'total_price']
+        data = request.get_json() or {}
+
+        required_fields = ['room_id', 'check_in_date', 'check_out_date']
         if not all(field in data for field in required_fields):
             return error_response('Missing required fields', 400)
-        
-        room_record = RoomRecord(
-            room_id=data['room_id'],
-            user_id=data['user_id'],
-            worker_id=data.get('worker_id'),
-            check_in_date=data['check_in_date'],
-            check_out_date=data['check_out_date'],
-            num_guests=data.get('num_guests', 1),
-            total_price=data['total_price'],
-            amount_paid=data.get('amount_paid', 0.00),
-            payment_status=data.get('payment_status', 'pending'),
-            booking_status=data.get('booking_status', 'confirmed'),
-            payment_method=data.get('payment_method'),
-            special_requests=data.get('special_requests')
+
+        booking, error, status = booking_service.create_booking(
+            data, actor=get_current_user(),
+            source=data.get('booking_source') or 'offline',
+            business_id=current_business_id(),
+            branch_id=data.get('branch_id') or current_branch_id(),
+            default_status=data.get('booking_status') or 'confirmed'
         )
-        
-        db.session.add(room_record)
-        db.session.commit()
-        
-        return success_response('Room record created successfully', room_record.to_dict(), status_code=201)
+        if error:
+            return error_response(error, status)
+
+        log_activity(ACTIVITY_CREATE, MODULE_BOOKINGS, booking.id, booking.booking_number,
+                     f"Created booking {booking.booking_number}", branch_id=booking.branch_id)
+        return success_response('Room record created successfully', booking.to_dict(), status_code=201)
     except Exception as e:
         db.session.rollback()
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['PUT'])
-@token_required
+@auth_required()
+@require_permission('edit')
 def update_room_record(id):
-    """Update room record (protected)"""
+    """Update a booking (availability re-validated by the booking service)"""
     try:
-        room_record = RoomRecord.query.get(id)
+        room_record = tenant_scope(RoomRecord, RoomRecord.query).filter(RoomRecord.id == id).first()
         if not room_record:
             return error_response('Room record not found', 404)
-        
-        data = request.get_json()
-        
-        if 'actual_check_in' in data:
-            room_record.actual_check_in = data['actual_check_in']
-        if 'actual_check_out' in data:
-            room_record.actual_check_out = data['actual_check_out']
-        if 'num_guests' in data:
-            room_record.num_guests = data['num_guests']
-        if 'amount_paid' in data:
-            room_record.amount_paid = data['amount_paid']
-        if 'payment_status' in data:
-            room_record.payment_status = data['payment_status']
-        if 'booking_status' in data:
-            room_record.booking_status = data['booking_status']
-        if 'payment_method' in data:
-            room_record.payment_method = data['payment_method']
-        if 'special_requests' in data:
-            room_record.special_requests = data['special_requests']
-        
-        db.session.commit()
-        
-        return success_response('Room record updated successfully', room_record.to_dict(), status_code=200)
+
+        updated, error, status = booking_service.update_booking(
+            room_record, request.get_json() or {}, get_current_user()
+        )
+        if error:
+            return error_response(error, status)
+
+        log_activity(ACTIVITY_UPDATE, MODULE_BOOKINGS, updated.id, updated.booking_number,
+                     f"Updated booking {updated.booking_number}", branch_id=updated.branch_id)
+        return success_response('Room record updated successfully', updated.to_dict(), status_code=200)
     except Exception as e:
         db.session.rollback()
         return error_response(f'Error: {str(e)}', 500)
 
 
 @bp.route('/<int:id>', methods=['DELETE'])
-@token_required
+@auth_required()
+@require_permission('delete')
 def delete_room_record(id):
-    """Delete room record (protected)"""
+    """Soft delete a room record (booking history and payments are preserved)"""
     try:
-        room_record = RoomRecord.query.get(id)
+        room_record = tenant_scope(RoomRecord, RoomRecord.query).filter(RoomRecord.id == id).first()
         if not room_record:
             return error_response('Room record not found', 404)
-        
-        db.session.delete(room_record)
+
+        if room_record.booking_status != 'cancelled':
+            booking_service.cancel_booking(room_record, get_current_user(),
+                                           'Deleted from the legacy booking list')
+        room_record.is_deleted = True
         db.session.commit()
-        
+
+        log_activity(ACTIVITY_DELETE, MODULE_BOOKINGS, id, room_record.booking_number,
+                     f"Deleted booking {room_record.booking_number}", branch_id=room_record.branch_id)
         return success_response('Room record deleted successfully', status_code=200)
     except Exception as e:
         db.session.rollback()
         return error_response(f'Error: {str(e)}', 500)
+

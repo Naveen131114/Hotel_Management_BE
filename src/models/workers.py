@@ -7,6 +7,8 @@ class Worker(db.Model):
     __tablename__ = 'workers'
     
     id = db.Column(db.Integer, primary_key=True)
+    business_id = db.Column(db.Integer, db.ForeignKey('businesses.id'), index=True)
+    branch_id = db.Column(db.Integer, db.ForeignKey('branches.id'), index=True)
     worker_type_id = db.Column(db.Integer, db.ForeignKey('worker_types.id'), nullable=False)
     first_name = db.Column(db.String(100), nullable=False)
     last_name = db.Column(db.String(100), nullable=False)
@@ -15,6 +17,8 @@ class Worker(db.Model):
     national_id = db.Column(db.String(50))
     status = db.Column(db.String(20), default='active')  # active, inactive, on_leave
     hire_date = db.Column(db.Date)
+    created_by = db.Column(db.Integer)
+    updated_by = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -24,6 +28,8 @@ class Worker(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'business_id': self.business_id,
+            'branch_id': self.branch_id,
             'worker_type_id': self.worker_type_id,
             'first_name': self.first_name,
             'last_name': self.last_name,
